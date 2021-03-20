@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -49,12 +50,53 @@ type Statement struct {
 }
 
 type Table struct {
-	NumOfRows int
-	Pages     [TABLE_MAX_PAGES]*Page
+	NumOfRows uint32
+	Pager
 }
 
 type Page struct {
 	Data [PAGE_SIZE]byte
+}
+
+type Pager struct {
+	*os.File
+	FileLength uint32
+	Pages     [TABLE_MAX_PAGES]*Page
+}
+
+func (p *Pager) GetPage(pageNum uint32) *Page {
+	if p.Pages[pageNum] == nil {
+		p.Pages[pageNum] = &Page{}
+		numOfPages := p.FileLength / PAGE_SIZE
+
+		if (p.FileLength % PAGE_SIZE) != 0 {
+			numOfPages++
+		}
+
+		if pageNum <= numOfPages {
+			b := make([]byte, PAGE_SIZE)
+			n, err := p.File.ReadAt(b, int64(pageNum) * PAGE_SIZE)
+			if err != nil {
+				fmt.Println("read page", n, err)
+			}
+			for i := 0; i < n; i++ {
+				p.Pages[pageNum].Data[i] = b[i]
+			}
+		}
+	}
+	return p.Pages[pageNum]
+}
+
+func (p *Pager) FlushPage(pageNum, size uint32) {
+	fmt.Println("Flush addi", pageNum, size)
+
+	b := p.Pages[pageNum].Data[:size]
+
+	n, err := p.File.WriteAt(b, int64(pageNum) * PAGE_SIZE)
+
+	if err != nil {
+		fmt.Println("flush page", n, err)
+	}
 }
 
 type Row struct {
@@ -63,8 +105,59 @@ type Row struct {
 	Email    string
 }
 
+func OpenDB(name string) *Table {
+
+	t := new(Table)
+	t.CreatePager(name)
+	t.NumOfRows = t.Pager.FileLength / ROW_SIZE
+
+	return t
+}
+
+func CloseDB(t *Table) {
+	numOfFullPages := t.NumOfRows / ROWS_PER_PAGE
+
+	for i := uint32(0); i < numOfFullPages; i++ {
+		if t.Pager.Pages[i] == nil {
+			continue
+		}
+
+		t.Pager.FlushPage(i, PAGE_SIZE)
+	}
+
+	if numOfAdditionalRows := t.NumOfRows % ROWS_PER_PAGE; numOfAdditionalRows > 0 {
+		pageNum := numOfFullPages
+
+		if t.Pager.Pages[pageNum] != nil {
+			t.Pager.FlushPage(pageNum, numOfAdditionalRows * ROW_SIZE)
+		}
+	}
+
+}
+
+func (t *Table) CreatePager(name string) {
+	t.Pager.File, _ = os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0644)
+	
+	l, err := t.Pager.File.Seek(0, io.SeekEnd)
+
+	if err != nil {
+		fmt.Println("create pager", err)
+	}
+
+	t.Pager.FileLength = uint32(l)
+}
+
+
 func main() {
-	t := Table{}
+
+	t := OpenDB("mydb")
+
+	// if len(os.Args) < 2 {
+	// 	panic("invalid argument")
+	// }
+
+	// t := OpenDB(os.Args[1])
+
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Println("Database Shell\n----------------")
@@ -87,6 +180,7 @@ repl:
 			switch code {
 			case META_EXIT:
 				fmt.Println("-> exiting database...")
+				CloseDB(t)
 				break repl
 
 			default:
@@ -101,7 +195,7 @@ repl:
 				continue repl
 			}
 
-			code, err = ExecuteStatement(&st, &t)
+			code, err = ExecuteStatement(&st, t)
 
 			if err != nil {
 				fmt.Println(code, err)
@@ -154,7 +248,7 @@ func ExecuteStatement(st *Statement, t *Table) (int, error) {
 
 func ExecuteSelect(t *Table) (int, error) {
 	fmt.Println("Row\tId\tUsername\tEmail")
-	for i := 0; i < t.NumOfRows; i++ {
+	for i := uint32(0); i < t.NumOfRows; i++ {
 		r := DeserializeRow(RowSlot(t, i))
 		fmt.Printf("(%d\t%d\t%s\t%s)\n", i, r.Id, r.Username, r.Email)
 	}
@@ -170,26 +264,22 @@ func ExecuteInsert(r Row, t *Table) (int, error) {
 	return SUCCESS, nil
 }
 
-func RowSlot(t *Table, n int) (*Page, int) {
+func RowSlot(t *Table, n uint32) (*Page, uint32) {
 	pageNum := n / ROWS_PER_PAGE
-	page := t.Pages[pageNum]
-	if page == nil {
-		t.Pages[pageNum] = new(Page)
-		page = t.Pages[pageNum]
-	}
+	page := t.Pager.GetPage(pageNum)
 	rowOffset := n % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 	return page, byteOffset
 }
 
-func I32ToB(p *Page, offset int, num uint32) {
+func I32ToB(p *Page, offset uint32, num uint32) {
 	for i := 0; i < 4; i++ {
 		p.Data[offset] = byte((num >> (8 * i)) & 0xff)
 		offset++
 	}
 }
 
-func BToI32(p *Page, offset int) (res uint32) {
+func BToI32(p *Page, offset uint32) (res uint32) {
 	for i := 0; i < 4; i++ {
 		res |= uint32(p.Data[offset]) << (8 * i)
 		offset++
@@ -197,9 +287,9 @@ func BToI32(p *Page, offset int) (res uint32) {
 	return
 }
 
-func BCopy(p *Page, offset, size int, b []byte) {
-	for i := 0; i < size; i++ {
-		if i == len(b) {
+func BCopy(p *Page, offset, size uint32, b []byte) {
+	for i := uint32(0); i < size; i++ {
+		if i == uint32(len(b)) {
 			break
 		}
 		p.Data[offset] = b[i]
@@ -228,7 +318,7 @@ func SerializeRow(r Row, t *Table) {
 	BCopy(p, offset, EMAIL_SIZE, b2)
 }
 
-func DeserializeRow(p *Page, offset int) Row {
+func DeserializeRow(p *Page, offset uint32) Row {
 	var r Row
 
 	l1 := BToI32(p, offset)
